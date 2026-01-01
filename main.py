@@ -301,12 +301,21 @@ class TokenSafetyAnalyzer:
 
 
 # Initialize OpenAI client
-openai_client = AsyncOpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-analyzer = TokenSafetyAnalyzer(openai_client)
+# Lazy-load OpenAI client to avoid startup errors
+def get_openai_client():
+    api_key = os.getenv("OPENAI_API_KEY")
+    if not api_key:
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
+    return AsyncOpenAI(api_key=api_key)
+
+def get_analyzer():
+    return TokenSafetyAnalyzer(get_openai_client())
 
 
 async def call_model(state: State) -> Dict[str, Any]:
     """Process conversational messages using LangGraph"""
+
+    analyzer = get_analyzer()
     
     latest_message = state.messages[-1] if state.messages else {}
     user_content = latest_message.get("content", "")

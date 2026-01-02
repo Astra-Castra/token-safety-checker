@@ -305,7 +305,13 @@ class TokenSafetyAnalyzer:
 def get_openai_client():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise ValueError("OPENAI_API_KEY environment variable is not set")
+        # Try alternate environment variable names
+        api_key = os.getenv("OPENAI_KEY")
+    if not api_key:
+        # Last resort: check if it's in a different format
+        import sys
+        print(f"DEBUG: All environment variables: {list(os.environ.keys())}", file=sys.stderr)
+        raise ValueError(f"OPENAI_API_KEY environment variable is not set. Available vars: {list(os.environ.keys())}")
     return AsyncOpenAI(api_key=api_key)
 
 def get_analyzer():

@@ -1,7 +1,5 @@
-"""Token Safety Checker - LangGraph Agent (Multi-Chain)
-Supports: Ethereum, BSC, Polygon, Arbitrum, Optimism, Base, Solana, Tron, Sui, Hyperliquid, TON, opBNB
-Can be deployed anywhere (Railway, Render, Fly.io, etc.)
-NO LangGraph Cloud subscription needed!
+"""Token Safety Checker - LangGraph Agent with A2A Protocol
+Multi-chain token safety checker with Warden Protocol A2A support
 """
 
 from __future__ import annotations
@@ -10,8 +8,10 @@ import os
 import re
 import asyncio
 import aiohttp
+import secrets
 from dataclasses import dataclass
-from typing import Any, Dict, List, TypedDict
+from typing import Any, Dict, List, TypedDict, Optional
+from datetime import datetime
 
 from dotenv import load_dotenv
 
@@ -20,7 +20,7 @@ load_dotenv()
 
 from langgraph.graph import StateGraph
 from openai import AsyncOpenAI
-from fastapi import FastAPI
+from fastapi import FastAPI, Header, HTTPException, Request
 from fastapi.responses import JSONResponse
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
@@ -38,6 +38,34 @@ class State:
     messages: List[Dict[str, Any]]
 
 
+# A2A Protocol Models
+class A2ATextPart(BaseModel):
+    kind: str = "text"
+    text: str
+
+
+class A2AMessage(BaseModel):
+    role: str
+    parts: List[A2ATextPart]
+    messageId: Optional[str] = None
+
+
+class A2AThread(BaseModel):
+    threadId: Optional[str] = None
+
+
+class A2AParams(BaseModel):
+    message: A2AMessage
+    thread: A2AThread
+
+
+class A2ARequest(BaseModel):
+    jsonrpc: str = "2.0"
+    id: str = ""
+    method: str = "message/send"
+    params: A2AParams
+
+
 class TokenSafetyAnalyzer:
     """Token Safety Analysis Tools"""
     
@@ -49,27 +77,19 @@ class TokenSafetyAnalyzer:
         # Chain ID mapping for GoPlus API
         self.chain_map = {
             # EVM Chains
-            "eth": "1",
-            "ethereum": "1",
-            "bsc": "56",
-            "binance": "56",
-            "polygon": "137",
-            "matic": "137",
+            "eth": "1", "ethereum": "1",
+            "bsc": "56", "binance": "56",
+            "polygon": "137", "matic": "137",
             "arbitrum": "42161",
             "optimism": "10",
             "base": "8453",
             "opbnb": "204",
-            "avalanche": "43114",
-            "avax": "43114",
-            "fantom": "250",
-            "ftm": "250",
-            "cronos": "25",
-            "cro": "25",
+            "avalanche": "43114", "avax": "43114",
+            "fantom": "250", "ftm": "250",
+            "cronos": "25", "cro": "25",
             # Non-EVM Chains
-            "solana": "solana",
-            "sol": "solana",
-            "tron": "tron",
-            "trx": "tron",
+            "solana": "solana", "sol": "solana",
+            "tron": "tron", "trx": "tron",
             "sui": "sui",
             "ton": "ton",
             "hyperliquid": "hyperliquid"
@@ -101,15 +121,12 @@ class TokenSafetyAnalyzer:
         """Query GoPlus Labs API for security data"""
         chain_id = self.chain_map.get(chain.lower(), "1")
         
-        # For non-EVM chains, GoPlus uses different endpoints
         if chain_id in ["solana", "tron", "sui", "ton", "hyperliquid"]:
-            # Special handling for non-EVM chains
             if chain_id == "solana":
                 url = "https://api.gopluslabs.io/api/v1/token_security/solana"
             elif chain_id == "tron":
                 url = "https://api.gopluslabs.io/api/v1/token_security/tron"
             else:
-                # For chains not yet fully supported by GoPlus
                 return self._limited_analysis(token_address, chain)
         else:
             url = f"{self.goplus_api}/{chain_id}"
@@ -125,7 +142,6 @@ class TokenSafetyAnalyzer:
                         token_data = result.get(token_address.lower(), {})
                         
                         if not token_data:
-                            # Try without lowercasing for non-EVM chains
                             token_data = result.get(token_address, {})
                         
                         return {
@@ -164,7 +180,7 @@ class TokenSafetyAnalyzer:
         }
     
     async def check_dexscreener(self, token_address: str) -> dict:
-        """Query DexScreener API for liquidity data - supports all chains"""
+        """Query DexScreener API for liquidity data"""
         url = f"{self.dexscreener_api}/{token_address}"
         
         try:
@@ -197,7 +213,6 @@ class TokenSafetyAnalyzer:
         risk_score = 0.0
         flags = []
         
-        # Check if data is limited
         if goplus_data.get("limited_data"):
             flags.append("ℹ️ Limited security data available for this chain")
         
@@ -300,18 +315,11 @@ class TokenSafetyAnalyzer:
         return report
 
 
-# Initialize OpenAI client
-# Lazy-load OpenAI client to avoid startup errors
+# Lazy-load OpenAI client
 def get_openai_client():
     api_key = os.getenv("OPENAI_API_KEY")
     if not api_key:
-        # Try alternate environment variable names
-        api_key = os.getenv("OPENAI_KEY")
-    if not api_key:
-        # Last resort: check if it's in a different format
-        import sys
-        print(f"DEBUG: All environment variables: {list(os.environ.keys())}", file=sys.stderr)
-        raise ValueError(f"OPENAI_API_KEY environment variable is not set. Available vars: {list(os.environ.keys())}")
+        raise ValueError("OPENAI_API_KEY environment variable is not set")
     return AsyncOpenAI(api_key=api_key)
 
 def get_analyzer():
@@ -320,20 +328,19 @@ def get_analyzer():
 
 async def call_model(state: State) -> Dict[str, Any]:
     """Process conversational messages using LangGraph"""
-
+    
     analyzer = get_analyzer()
     
     latest_message = state.messages[-1] if state.messages else {}
     user_content = latest_message.get("content", "")
     
-    # Extract token address (supports multiple formats)
+    # Extract token address
     token_address, address_type = analyzer.extract_token_address(user_content)
     
-    # Determine chain from message
+    # Determine chain
     chain = "eth"
     user_lower = user_content.lower()
     
-    # Check for chain mentions
     if "bsc" in user_lower or "binance" in user_lower:
         chain = "bsc"
     elif "polygon" in user_lower or "matic" in user_lower:
@@ -364,7 +371,6 @@ async def call_model(state: State) -> Dict[str, Any]:
         except Exception as e:
             ai_response = f"❌ Error analyzing token: {str(e)}"
     else:
-        # No token address found
         ai_response = """I'm a Token Safety Checker. Please provide a token contract address to analyze.
 
 Supported chains:
@@ -392,19 +398,40 @@ graph = (
 )
 
 
-# FastAPI wrapper for HTTP access
-app = FastAPI(title="Token Safety Checker API - Multi-Chain")
+# FastAPI wrapper
+app = FastAPI(title="Token Safety Checker API - Multi-Chain with A2A")
 
-# ✅ ENABLE CORS - THIS FIXES THE BROWSER ERROR
+# Enable CORS
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # Allows all origins
+    allow_origins=["*"],
     allow_credentials=True,
-    allow_methods=["*"],  # Allows all methods
-    allow_headers=["*"],  # Allows all headers
+    allow_methods=["*"],
+    allow_headers=["*"],
 )
 
 
+# API Key Management
+VALID_API_KEYS = set()
+
+# Generate default API key on startup
+DEFAULT_API_KEY = os.getenv("API_KEY", secrets.token_urlsafe(32))
+VALID_API_KEYS.add(DEFAULT_API_KEY)
+
+# Print API key on startup for first-time setup
+print(f"\n{'='*60}")
+print(f"🔑 YOUR API KEY: {DEFAULT_API_KEY}")
+print(f"{'='*60}\n")
+
+
+def verify_api_key(x_api_key: str = Header(None)):
+    """Verify API key from header"""
+    if not x_api_key or x_api_key not in VALID_API_KEYS:
+        raise HTTPException(status_code=401, detail="Invalid or missing API key")
+    return x_api_key
+
+
+# Standard Models
 class MessageRequest(BaseModel):
     content: str
     chain: str = "eth"
@@ -414,7 +441,8 @@ class MessageRequest(BaseModel):
 async def root():
     """Root endpoint"""
     return {
-        "message": "Token Safety Checker API - Multi-Chain Support",
+        "message": "Token Safety Checker API - Multi-Chain with A2A Protocol",
+        "version": "3.0-a2a",
         "supported_chains": [
             "Ethereum (eth)", "BSC (bsc)", "Polygon (polygon)", 
             "Arbitrum (arbitrum)", "Optimism (optimism)", "Base (base)",
@@ -422,8 +450,10 @@ async def root():
             "TON (ton)", "Hyperliquid (hyperliquid)", "opBNB (opbnb)"
         ],
         "endpoints": {
-            "/analyze": "POST - Analyze a token",
-            "/health": "GET - Health check"
+            "/analyze": "POST - Analyze a token (requires x-api-key)",
+            "/a2a/{assistant_id}": "POST - A2A Protocol endpoint (requires x-api-key)",
+            "/health": "GET - Health check",
+            "/generate-key": "POST - Generate new API key (requires existing key)"
         }
     }
 
@@ -431,23 +461,24 @@ async def root():
 @app.get("/health")
 async def health():
     """Health check endpoint"""
-    return {"status": "healthy", "version": "2.0-multi-chain"}
+    return {"status": "healthy", "version": "3.0-a2a"}
 
 
 @app.post("/analyze")
-async def analyze_endpoint(request: MessageRequest):
-    """Analyze a token via HTTP POST"""
+async def analyze_endpoint(
+    request: MessageRequest,
+    api_key: str = Header(None, alias="x-api-key")
+):
+    """Analyze a token via HTTP POST (requires API key)"""
+    verify_api_key(api_key)
+    
     try:
-        # Create state for LangGraph
         state = State(messages=[{
             "role": "user",
             "content": f"{request.content} on {request.chain}"
         }])
         
-        # Run the graph
         result = await graph.ainvoke(state)
-        
-        # Extract response
         response_content = result["messages"][-1]["content"]
         
         return JSONResponse({
@@ -460,6 +491,80 @@ async def analyze_endpoint(request: MessageRequest):
             "success": False,
             "error": str(e)
         }, status_code=500)
+
+
+@app.post("/a2a/{assistant_id}")
+async def a2a_endpoint(
+    assistant_id: str,
+    request: A2ARequest,
+    api_key: str = Header(None, alias="x-api-key")
+):
+    """A2A Protocol endpoint (Warden Protocol compatible)"""
+    verify_api_key(api_key)
+    
+    try:
+        # Extract text from A2A message format
+        user_message = ""
+        for part in request.params.message.parts:
+            if part.kind == "text":
+                user_message += part.text + " "
+        
+        user_message = user_message.strip()
+        
+        # Process with LangGraph
+        state = State(messages=[{
+            "role": "user",
+            "content": user_message
+        }])
+        
+        result = await graph.ainvoke(state)
+        response_content = result["messages"][-1]["content"]
+        
+        # Return A2A formatted response
+        return {
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "result": {
+                "message": {
+                    "role": "assistant",
+                    "parts": [
+                        {
+                            "kind": "text",
+                            "text": response_content
+                        }
+                    ],
+                    "messageId": f"msg_{datetime.now().timestamp()}"
+                },
+                "thread": {
+                    "threadId": request.params.thread.threadId or f"thread_{assistant_id}"
+                }
+            }
+        }
+        
+    except Exception as e:
+        return JSONResponse({
+            "jsonrpc": "2.0",
+            "id": request.id,
+            "error": {
+                "code": -32603,
+                "message": f"Internal error: {str(e)}"
+            }
+        }, status_code=500)
+
+
+@app.post("/generate-key")
+async def generate_key(api_key: str = Header(None, alias="x-api-key")):
+    """Generate a new API key (requires existing valid key)"""
+    verify_api_key(api_key)
+    
+    new_key = secrets.token_urlsafe(32)
+    VALID_API_KEYS.add(new_key)
+    
+    return {
+        "success": True,
+        "api_key": new_key,
+        "message": "New API key generated successfully"
+    }
 
 
 if __name__ == "__main__":

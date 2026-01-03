@@ -502,6 +502,8 @@ async def a2a_endpoint(
     """A2A Protocol endpoint (Warden Protocol compatible)"""
     verify_api_key(api_key)
     
+    import sys
+    
     try:
         # Extract text from A2A message format
         user_message = ""
@@ -511,14 +513,25 @@ async def a2a_endpoint(
         
         user_message = user_message.strip()
         
+        print(f"🔍 DEBUG: Received message: {user_message}", file=sys.stderr, flush=True)
+        
         # Process with LangGraph
         state = State(messages=[{
             "role": "user",
             "content": user_message
         }])
         
+        print(f"🔍 DEBUG: About to invoke graph", file=sys.stderr, flush=True)
         result = await graph.ainvoke(state)
-        response_content = result["messages"][-1]["content"]
+        print(f"🔍 DEBUG: Graph invoked, result keys: {result.keys()}", file=sys.stderr, flush=True)
+        
+        if "messages" in result and len(result["messages"]) > 0:
+            response_content = result["messages"][-1]["content"]
+            print(f"🔍 DEBUG: Response length: {len(response_content)} chars", file=sys.stderr, flush=True)
+            print(f"🔍 DEBUG: Response preview: {response_content[:100]}...", file=sys.stderr, flush=True)
+        else:
+            print(f"🔍 DEBUG: No messages in result!", file=sys.stderr, flush=True)
+            response_content = "Error: No response generated"
         
         # Return A2A formatted response
         return {
@@ -542,6 +555,11 @@ async def a2a_endpoint(
         }
         
     except Exception as e:
+        import traceback
+        error_details = traceback.format_exc()
+        print(f"❌ ERROR in a2a_endpoint: {str(e)}", file=sys.stderr, flush=True)
+        print(f"❌ Full traceback:\n{error_details}", file=sys.stderr, flush=True)
+        
         return JSONResponse({
             "jsonrpc": "2.0",
             "id": request.id,
@@ -550,7 +568,6 @@ async def a2a_endpoint(
                 "message": f"Internal error: {str(e)}"
             }
         }, status_code=500)
-
 
 @app.post("/generate-key")
 async def generate_key(api_key: str = Header(None, alias="x-api-key")):
